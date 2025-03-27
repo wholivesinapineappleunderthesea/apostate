@@ -1,5 +1,6 @@
 use glfw::fail_on_errors;
 use glm::*;
+use wgpu::core::command;
 use std::env::current_dir;
 use std::fs;
 use wgpu::include_wgsl;
@@ -17,9 +18,15 @@ pub struct GfxRenderer<'a> {
     window_surface_size: (i32, i32),
     is_minimized: bool,
 
+    uniform_buffer: wgpu::Buffer,
+    bind_group_layouts: Vec<wgpu::BindGroupLayout>,
+    bind_groups: Vec<wgpu::BindGroup>,
+
     temp_quadbuffer: wgpu::Buffer,
     temp_quadidxbuffer: wgpu::Buffer,
     temp_pipeline: wgpu::RenderPipeline,
+
+    cumulative_time: f32,
 }
 
 #[repr(C)]
@@ -30,12 +37,12 @@ pub struct VtxLayoutPos3Col3 {
 
 impl VtxLayoutPos3Col3 {
     pub fn get_layout() -> wgpu::VertexBufferLayout<'static> {
-        const attribs: [wgpu::VertexAttribute; 2] =
+        const ATTRIBS: [wgpu::VertexAttribute; 2] =
             wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<VtxLayoutPos3Col3>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &attribs,
+            attributes: &ATTRIBS,
         }
     }
 }
@@ -100,13 +107,14 @@ fn create_pipeline(
     name: &str,
     vtxbuf_layouts: Vec<wgpu::VertexBufferLayout<'static>>,
     pixel_format: wgpu::TextureFormat,
+    bind_group_layouts: Vec<&wgpu::BindGroupLayout>,
 ) -> wgpu::RenderPipeline {
     let shader_module = device.create_shader_module(shader_module_desc);
 
     let pipeline_layout_label = format!("{} PIPELINE_LAYOUT", name);
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(pipeline_layout_label.as_str()),
-        bind_group_layouts: &[],
+        bind_group_layouts: &bind_group_layouts,
         push_constant_ranges: &[],
     });
 
@@ -115,6 +123,7 @@ fn create_pipeline(
         blend: Some(wgpu::BlendState::REPLACE),
         write_mask: wgpu::ColorWrites::ALL,
     })];
+
 
     let render_pipeline_label = format!("{} PIPELINE", name);
     let render_pipeline_desc = wgpu::RenderPipelineDescriptor {
@@ -221,6 +230,50 @@ impl<'a> GfxRenderer<'a> {
 
         surface.configure(&device, &surface_config);
 
+        let bind_group_layouts_desc = wgpu::BindGroupLayoutDescriptor {
+            label: Some("Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry{
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }
+            ],
+        };
+
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Uniform Buffer"),
+            size: std::mem::size_of::<f32>() as u64 * 4,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let bind_group_layouts = vec![
+            device.create_bind_group_layout(&bind_group_layouts_desc)
+        ];
+
+        let bind_groups = vec![
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Bind Group"),
+                layout: &bind_group_layouts[0],
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &uniform_buffer,
+                            offset: 0,
+                            size: None,
+                        }),
+                    }
+                ],
+            })
+        ];
+
         let quad_buffer = make_quad(&device);
         let quad_indexbuf = make_quad_indexbuf(&device);
         let tri_pipeline_src = include_wgsl!("shdrs/test.wgsl");
@@ -230,7 +283,10 @@ impl<'a> GfxRenderer<'a> {
             "test.wgsl",
             vec![VtxLayoutPos3Col3::get_layout()],
             surface_config.format,
+            bind_group_layouts.iter().collect(),
         );
+
+        
 
         Self {
             glfw_backend: glfw,
@@ -244,9 +300,15 @@ impl<'a> GfxRenderer<'a> {
             window_surface_size: size,
             is_minimized: false,
 
+            uniform_buffer: uniform_buffer,
+            bind_group_layouts: bind_group_layouts,
+            bind_groups: bind_groups,
+
             temp_quadbuffer: quad_buffer,
             temp_quadidxbuffer: quad_indexbuf,
             temp_pipeline: tri_pipeline,
+
+            cumulative_time: 0.0,
         }
     }
 
@@ -313,6 +375,16 @@ impl<'a> GfxRenderer<'a> {
             label: Some("Render Encoder"),
         };
 
+        let time = self.cumulative_time;
+        self.cumulative_time += 0.01;
+        let time_bytes = unsafe { std::slice::from_raw_parts(&time as *const f32 as *const u8, 4 * 4) };
+
+        self.gpu_queue.write_buffer(
+            &self.uniform_buffer,
+            0,
+            time_bytes,
+        );
+
         let mut command_encoder = self
             .gpu_device
             .create_command_encoder(&command_encoder_descriptor);
@@ -334,9 +406,18 @@ impl<'a> GfxRenderer<'a> {
             timestamp_writes: None,
         };
 
+        
+        
+
+
         {
             let mut pass = command_encoder.begin_render_pass(&render_pass_descriptor);
             pass.set_pipeline(&self.temp_pipeline);
+
+            pass.set_bind_group(0, &self.bind_groups[0], &[]);
+            
+
+
             pass.set_vertex_buffer(0, self.temp_quadbuffer.slice(..));
             pass.set_index_buffer(self.temp_quadidxbuffer.slice(..), wgpu::IndexFormat::Uint16);        
             pass.draw_indexed(0..6, 0, 0..1);

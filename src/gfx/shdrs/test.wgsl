@@ -8,11 +8,14 @@ struct FSInput {
     @location(0) color: vec3<f32>,
 };
 
+@group(0) @binding(0) var<uniform> uTime: f32;
+
 @vertex
 fn vs_main(vertex: Vertex) -> FSInput {
 
     var out: FSInput;
     out.position = vec4<f32>(vertex.position, 1.0);
+    out.position.x += sin(uTime) * 0.5;
     out.color = vertex.color;
     return out;
 }
