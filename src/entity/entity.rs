@@ -1,147 +1,169 @@
-use std::{any::Any, collections::HashMap, sync::{Arc, Weak}};
-use std::sync::{Mutex, RwLock};
+use std::{
+    any::Any,
+    cell::{Ref, RefCell, RefMut},
+    collections::HashMap,
+    rc::{Rc, Weak},
+};
+
 use bitflags::bitflags;
 
+// Trait for base component info
 pub trait Component: Any {
     fn as_any(&self) -> &dyn Any;
-    fn name(&self) -> &str;
+    fn get_component_type_name(&self) -> String;
 }
 
-impl<T: Any> Component for T
-where
-    T: 'static + Any + ComponentBaseTrait,
-{
+// Trait for components stored in Entity (inside RefCell)
+pub trait ComponentCell {
+    fn as_any(&self) -> &dyn Any;
+    fn get_component_type_name(&self) -> String;
+}
+
+// Trait to get the type name
+pub trait ComponentBaseTrait {
+    fn get_component_type_name(&self) -> String;
+}
+
+// Component wrapper using RefCell for interior mutability
+pub struct ComponentWrapper<T: Component> {
+    inner: RefCell<T>,
+}
+
+impl<T: Component> ComponentWrapper<T> {
+    pub fn new(component: T) -> Self {
+        Self {
+            inner: RefCell::new(component),
+        }
+    }
+
+    pub fn borrow(&self) -> Ref<'_, T> {
+        self.inner.borrow()
+    }
+
+    pub fn borrow_mut(&self) -> RefMut<'_, T> {
+        self.inner.borrow_mut()
+    }
+}
+
+impl<T: Component + 'static> ComponentCell for ComponentWrapper<T> {
+    fn as_any(&self) -> &dyn Any {
+        &self.inner
+    }
+
+    fn get_component_type_name(&self) -> String {
+        // Borrow the RefCell and clone the string to return an owned value
+        let borrowed = self.inner.borrow();
+        borrowed.get_component_type_name().to_string()
+    }
+}
+
+// Blanket impl for all Component types
+impl<T: Any + ComponentBaseTrait + 'static> Component for T {
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    fn name(&self) -> &str {
+    fn get_component_type_name(&self) -> String {
         self.get_component_type_name()
     }
 }
 
-trait ComponentBaseTrait {
-    fn get_component_type_name(&self) -> &str;
-}
-
 bitflags! {
-    pub struct EntityFlags: u32
-    {
+    pub struct EntityFlags: u32 {
         const NONE = 0b0000_0000;
         const ACTIVE = 0b0000_0001;
     }
 }
 
-pub struct Entity
-{
+pub struct Entity {
     pub name: Option<String>,
     pub flags: EntityFlags,
-    pub components: Vec<Box<Arc<dyn Component>>>,
-    pub world: Weak<RwLock<World>>,
+    pub components: Vec<Box<dyn ComponentCell>>,
+    pub world: Weak<RefCell<World>>,
 }
 
-impl Entity
-{
-    
-    pub fn add_component<T: Component + 'static>(&mut self, component: T)
-    {
-        self.components.push(Box::new(Arc::new(component)));
+impl Entity {
+    pub fn add_component<T: Component + 'static>(&mut self, component: T) {
+        self.components.push(Box::new(ComponentWrapper::new(component)));
     }
 
-    // iterates components, looks for the first one that derives from T
-    pub fn get_component<T: Component + 'static>(&self) -> Option<&T>
-    {
-        for component in &self.components
-        {
-            if let Some(component) = component.as_any().downcast_ref::<T>()
-            {
-                return Some(component);
+    pub fn get_component<T: Component + 'static>(&self) -> Option<Ref<'_, T>> {
+        for component in &self.components {
+            if let Some(cell) = component.as_any().downcast_ref::<RefCell<T>>() {
+                return Some(cell.borrow());
             }
         }
         None
     }
 
-    pub fn component_count(&self) -> usize
-    {
+    pub fn get_component_mut<T: Component + 'static>(&self) -> Option<RefMut<'_, T>> {
+        for component in &self.components {
+            if let Some(cell) = component.as_any().downcast_ref::<RefCell<T>>() {
+                return Some(cell.borrow_mut());
+            }
+        }
+        None
+    }
+
+    pub fn component_count(&self) -> usize {
         self.components.len()
     }
-
-    /*
-    
-    
-    
-    pub fn get_component_mut<T: Component + 'static>(&mut self) -> Option<&mut T>
-    {
-        for component in &mut self.components
-        {
-            if let Some(component) = component.downcast_mut::<T>()
-            {
-                return Some(component);
-            }
-        }
-        None
-    }
-    */
 }
 
-pub struct World
-{
-    pub self_ref: Weak<RwLock<World>>,
-    pub entities: Vec<Entity>,
+pub struct World {
+    pub self_ref: Weak<RefCell<World>>,
+    pub entities: Vec<Rc<RefCell<Entity>>>,
 }
 
-impl World
-{
-    pub fn new() -> Arc<RwLock<World>>
-    {
-        let world = World{
+impl World {
+    pub fn new() -> Rc<RefCell<World>> {
+        let world = Rc::new(RefCell::new(World {
             self_ref: Weak::new(),
             entities: Vec::new(),
-        };
-        let arc_world = Arc::new(RwLock::new(world));
-        let weak = Arc::downgrade(&arc_world);
-        arc_world.write().unwrap().self_ref = weak;
-        arc_world
+        }));
+        world.borrow_mut().self_ref = Rc::downgrade(&world);
+        world
     }
 
-    pub fn new_entity(&mut self) -> &mut Entity
-    {
-        let entity = Entity{
+    pub fn new_entity(&mut self) -> Rc<RefCell<Entity>> {
+        let entity = Rc::new(RefCell::new(Entity {
             name: None,
             flags: EntityFlags::ACTIVE,
             components: Vec::new(),
             world: self.self_ref.clone(),
-        };
-        self.entities.push(entity);
-        self.entities.last_mut().unwrap()
+        }));
+        self.entities.push(entity.clone());
+        entity
     }
 
-    pub fn destroy_entity(&mut self, entity: &mut Entity)
-    {
-        entity.flags.remove(EntityFlags::ACTIVE);
-        self.entities.retain(|e| e as *const Entity != entity as *const Entity);
+    pub fn destroy_entity(&mut self, entity: &Rc<RefCell<Entity>>) {
+        entity.borrow_mut().flags.remove(EntityFlags::ACTIVE);
+        let ptr = Rc::as_ptr(entity);
+        self.entities.retain(|e| Rc::as_ptr(e) != ptr);
     }
-
 }
 
-// test components
+// -----------------------------
+// Example Components
+// -----------------------------
+
 pub struct Health {
     pub hp: i32,
 }
 
 impl ComponentBaseTrait for Health {
-    fn get_component_type_name(&self) -> &str {
-        "Health"
+    fn get_component_type_name(&self) -> String {
+        "Health".to_string()
     }
 }
 
 pub struct Position {
-    pub y: f32,
     pub x: f32,
+    pub y: f32,
 }
 
 impl ComponentBaseTrait for Position {
-    fn get_component_type_name(&self) -> &str {
-        "Position"
+    fn get_component_type_name(&self) -> String {
+        "Position".to_string()
     }
 }
