@@ -27,6 +27,7 @@ dependencies = [
  "glfw",
  "glm",
  "pollster",
+ "rand 0.3.23",
  "wgpu",
 ]
 

@@ -4,6 +4,7 @@ use wgpu::core::command;
 use std::env::current_dir;
 use std::fs;
 use wgpu::include_wgsl;
+use rand::Rng;
 use wgpu::util::DeviceExt;
 
 pub struct GfxRenderer<'a> {
@@ -26,21 +27,25 @@ pub struct GfxRenderer<'a> {
     temp_quadidxbuffer: wgpu::Buffer,
     temp_pipeline: wgpu::RenderPipeline,
 
+    temp_sampler: wgpu::Sampler,
+    temp_texture: wgpu::Texture,
+    temp_texture_view: wgpu::TextureView,
+
     cumulative_time: f32,
 }
 
 #[repr(C)]
-pub struct VtxLayoutPos3Col3 {
+pub struct VtxLayoutPos3UV2 {
     pos: Vec3,
-    color: Vec3,
+    uv: Vec2,
 }
 
-impl VtxLayoutPos3Col3 {
+impl VtxLayoutPos3UV2 {
     pub fn get_layout() -> wgpu::VertexBufferLayout<'static> {
         const ATTRIBS: [wgpu::VertexAttribute; 2] =
-            wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
+            wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2];
         wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<VtxLayoutPos3Col3>() as wgpu::BufferAddress,
+            array_stride: std::mem::size_of::<VtxLayoutPos3UV2>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &ATTRIBS,
         }
@@ -54,26 +59,26 @@ unsafe fn any_as_u8_slice<T: Sized>(p: &T) -> &[u8] {
 }
 
 fn make_quad(device: &wgpu::Device) -> wgpu::Buffer {
-    let vertices: [VtxLayoutPos3Col3; 4] = [
+    let vertices: [VtxLayoutPos3UV2; 4] = [
         // top-left
-        VtxLayoutPos3Col3 {
+        VtxLayoutPos3UV2 {
             pos: vec3(-0.5, 0.5, 0.0),
-            color: vec3(1.0, 0.0, 0.0),
+            uv: vec2(0.0, 0.0),
         },
         // top-right
-        VtxLayoutPos3Col3 {
+        VtxLayoutPos3UV2 {
             pos: vec3(0.5, 0.5, 0.0),
-            color: vec3(0.0, 1.0, 0.0),
+            uv: vec2(1.0, 0.0),
         },
         // bottom-right
-        VtxLayoutPos3Col3 {
+        VtxLayoutPos3UV2 {
             pos: vec3(0.5, -0.5, 0.0),
-            color: vec3(0.0, 0.0, 1.0),
+            uv: vec2(1.0, 1.0),
         },
         // bottom-left
-        VtxLayoutPos3Col3 {
+        VtxLayoutPos3UV2 {
             pos: vec3(-0.5, -0.5, 0.0),
-            color: vec3(1.0, 1.0, 1.0),
+            uv: vec2(0.0, 1.0),
         },
     ];
     let bytes: &[u8] = unsafe { any_as_u8_slice(&vertices) };
@@ -235,14 +240,32 @@ impl<'a> GfxRenderer<'a> {
             entries: &[
                 wgpu::BindGroupLayoutEntry{
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
                     count: None,
-                }
+                },
+
+                // Diffuse texture
+                wgpu::BindGroupLayoutEntry{
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry{
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         };
 
@@ -257,6 +280,61 @@ impl<'a> GfxRenderer<'a> {
             device.create_bind_group_layout(&bind_group_layouts_desc)
         ];
 
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
+            lod_min_clamp: 0.0,
+            lod_max_clamp: 100.0,
+            compare: None,
+            anisotropy_clamp: 1,
+            border_color: None,
+        });
+
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Texture"),
+            size: wgpu::Extent3d {
+                width: 256,
+                height: 256,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[wgpu::TextureFormat::Rgba8UnormSrgb],
+        });
+
+        // fill the texture with random data
+        let texture_data: Vec<u8> = (0..256 * 256 * 4)
+            .map(|_| (rand::random::<f32>() * 255.0) as u8)
+            .collect(); 
+        queue.write_texture(wgpu::ImageCopyTexture {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &texture_data,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * 256),
+            rows_per_image: Some(256),
+        },
+        wgpu::Extent3d{
+            width: 256,
+            height: 256,
+            depth_or_array_layers: 1,
+        });
+
+
+        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
         let bind_groups = vec![
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Bind Group"),
@@ -269,7 +347,15 @@ impl<'a> GfxRenderer<'a> {
                             offset: 0,
                             size: None,
                         }),
-                    }
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&texture_view)
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
                 ],
             })
         ];
@@ -281,7 +367,7 @@ impl<'a> GfxRenderer<'a> {
             &device,
             tri_pipeline_src,
             "test.wgsl",
-            vec![VtxLayoutPos3Col3::get_layout()],
+            vec![VtxLayoutPos3UV2::get_layout()],
             surface_config.format,
             bind_group_layouts.iter().collect(),
         );
@@ -307,6 +393,10 @@ impl<'a> GfxRenderer<'a> {
             temp_quadbuffer: quad_buffer,
             temp_quadidxbuffer: quad_indexbuf,
             temp_pipeline: tri_pipeline,
+
+            temp_sampler: sampler,
+            temp_texture: texture,
+            temp_texture_view: texture_view,
 
             cumulative_time: 0.0,
         }
