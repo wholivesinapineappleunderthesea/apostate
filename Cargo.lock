@@ -24,6 +24,7 @@ dependencies = [
 name = "apostate"
 version = "0.1.0"
 dependencies = [
+ "bitflags 1.3.2",
  "glfw",
  "glm",
  "pollster",
